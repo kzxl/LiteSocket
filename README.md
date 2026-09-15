@@ -1,12 +1,35 @@
-# LiteSocket
+# LiteSocket 2.x
 
 [![Latest Version](https://img.shields.io/github/v/release/kzxl/LiteSocket?label=version&color=blue)](https://github.com/kzxl/LiteSocket/releases)
 [![PHP Version](https://img.shields.io/badge/php-%3E%3D8.2-8892BF.svg)](https://php.net)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Tests: Passing](https://img.shields.io/badge/tests-19%20passed-brightgreen.svg)](tests/)
 
-An ultra-lightweight, zero-dependency, sovereign RFC 6455 WebSocket Server and Server-Sent Events (SSE) Streamer for **PHP 8.2+** with Room Pub/Sub and cross-platform TypeScript Client.
+An ultra-high-performance, zero-dependency RFC 6455 WebSocket Server and Server-Sent Events (SSE) Streamer for **PHP 8.2+** featuring 5 modular cores, non-blocking WriteQueue with Backpressure, Router dispatcher, and independent EventLoop.
 
 Part of the **LitePlatform** sovereign software suite (< 10MB RAM, zero 3rd-party vendor lock-in).
+
+---
+
+## ⚡ Architectural Highlights (LiteSocket 2.x)
+
+LiteSocket 2.x transitions from a single God-Class server into 5 decoupled cores:
+
+```
+LiteSocket/
+├── Runtime/      # StreamSelectLoop: multiplexed non-blocking I/O + independent microtime Timer Queue
+├── Transport/    # StreamSocketTransport: TCP bind, listen (SO_REUSEPORT), accept
+├── Protocol/     # RFC 6455 Handshake, Origin validation, Streaming FrameParser
+├── Connection/   # ConnectionPool (O(1)), ReadBuffer (OOM Guard), WriteQueue (Backpressure)
+└── Messaging/    # Router dispatcher, lightweight in-memory RoomManager, PubSub contract
+```
+
+### Key Enhancements in 2.x
+- **Independent EventLoop**: Network I/O is completely decoupled from game/application tick. Network events trigger with zero latency, while game ticks execute via recurring timers.
+- **WriteQueue & Partial-Write Protection**: Outgoing data is buffered in RAM. Non-blocking `@fwrite()` prevents TCP stream corruption on slow or lagging clients.
+- **Backpressure & Drop Policies**: Configurable buffer limit (`maxWriteBuffer`, default 4MB). Droppable packets (e.g. player movement / telemetry) are discarded gracefully when buffers are full.
+- **Message Router**: Expressive routing (`$server->route('chat', ...)`), removing massive application `switch-case` blocks.
+- **100% Backward Compatible**: Existing applications run seamlessly without code changes.
 
 ---
 
@@ -17,30 +40,7 @@ Part of the **LitePlatform** sovereign software suite (< 10MB RAM, zero 3rd-part
 composer require kzxl/lite-socket
 ```
 
-### Option 2: Direct from Git Repository (VCS)
-To pull directly from the official GitHub repository without waiting for Packagist synchronization, add the VCS repository to your project's `composer.json`:
-
-```json
-{
-    "repositories": [
-        {
-            "type": "vcs",
-            "url": "https://github.com/kzxl/LiteSocket.git"
-        }
-    ],
-    "require": {
-        "kzxl/lite-socket": "^1.1.0"
-    }
-}
-```
-Or configure via CLI:
-```bash
-composer config repositories.lite-socket vcs https://github.com/kzxl/LiteSocket.git
-composer require kzxl/lite-socket:^1.1.0
-```
-
-### Option 3: Local Path Repository (Monorepo / Development)
-For local development where changes should reflect immediately via symlink:
+### Option 2: Local Path Repository (Monorepo)
 ```json
 {
     "repositories": [
@@ -60,22 +60,9 @@ For local development where changes should reflect immediately via symlink:
 
 ---
 
-## ⚡ Key Features
+## 🚀 Quick Start
 
-- **Zero 3rd-Party Dependencies**: Pure PHP 8.2+ using native `stream_socket_server` and `stream_select`. No C-extensions (`ext-swoole`), no Node.js sidecars.
-- **RFC 6455 Compliant**: Handshake calculation with SHA1 base64 sec-key, binary/text framing, masking/unmasking, and ping/pong heartbeats.
-- **Room / Channel Pub-Sub**: Shard connections into game zones (`CH-1_SanctuaryHaven`), market tickers, or private chat channels.
-- **Dual Transport (VPS + Shared Hosting)**:
-  - **WebSocket Daemon**: Full-duplex TCP for VPS and containers (`php bin/socket.php`).
-  - **Server-Sent Events (SSE) Fallback**: For cPanel or environments where custom TCP ports are blocked.
-- **High-Performance Event Loop**: Non-blocking `stream_select` with configurable tick interval (e.g., 20 TPS for authoritative game tick).
-- **TypeScript SDK Included**: Ready-to-use client (`LiteSocketClient.ts`) with exponential backoff auto-reconnect and room listeners.
-
----
-
-## 🚀 Quick Start (WebSocket Server)
-
-Create `bin/socket.php`:
+### Basic Server with Routing
 
 ```php
 <?php
@@ -89,67 +76,58 @@ use LiteSocket\Connection;
 
 $server = new WebSocketServer(host: '0.0.0.0', port: 8088);
 
-// Connection event
-$server->on('connect', function (Connection $conn) use ($server) {
-    echo "Client connected: {$conn->getId()} from {$conn->getRemoteAddress()}\n";
-    $conn->sendJson(['type' => 'welcome', 'connId' => $conn->getId()]);
+// 1. Connection Event
+$server->on('connect', function (Connection $conn) {
+    echo "Client connected: {$conn->id()} from {$conn->ip()}\n";
+    $conn->sendJson(['type' => 'welcome', 'connId' => $conn->id()]);
 });
 
-// Message event
-$server->on('message', function (Connection $conn, string $raw, ?array $json) use ($server) {
-    if (!$json) return;
-
-    switch ($json['type'] ?? '') {
-        case 'player_move':
-            // Broadcast player position to everyone in the same room
-            $room = $conn->getRooms()[0] ?? 'general';
-            $server->broadcastToRoom($room, [
-                'type' => 'player_moved',
-                'id'   => $conn->getId(),
-                'x'    => $json['x'],
-                'y'    => $json['y']
-            ], $conn);
-            break;
-
-        case 'chat':
-            $server->broadcastAll([
-                'type'    => 'chat_broadcast',
-                'sender'  => $conn->getId(),
-                'message' => $json['text']
-            ]);
-            break;
-    }
+// 2. Expressive Message Routing (LiteSocket 2.x)
+$server->route('player_move', function (Connection $conn, array $data) use ($server) {
+    $room = $conn->rooms()[0] ?? 'general';
+    // Broadcast position update to all other players in this room (droppable under backpressure)
+    $server->broadcastToRoom($room, [
+        'type' => 'player_moved',
+        'id'   => $conn->id(),
+        'x'    => $data['x'] ?? 0,
+        'y'    => $data['y'] ?? 0,
+    ], exclude: $conn, droppable: true);
 });
 
-// Run non-blocking event loop (20 TPS tick rate)
+$server->route('chat', function (Connection $conn, array $data) use ($server) {
+    $server->broadcastAll([
+        'type'    => 'chat_message',
+        'sender'  => $conn->id(),
+        'message' => $data['text'] ?? '',
+    ]);
+});
+
+// 3. Disconnect Event
+$server->on('close', function (Connection $conn) {
+    echo "Client disconnected: {$conn->id()}\n";
+});
+
+// Run server with authoritative game tick (20 TPS)
 $server->run(tickInterval: 0.05);
-```
-
-Run daemon:
-```bash
-php bin/socket.php
 ```
 
 ---
 
-## 🌐 TypeScript Client Usage
+## 📊 Performance Benchmarks
 
-```typescript
-import { LiteSocketClient } from './LiteSocketClient';
+Measured on PHP 8.2.12 (Single-core CPU):
 
-const socket = new LiteSocketClient({
-  url: 'ws://localhost:8088',
-  autoJoinRooms: ['CH-1_SanctuaryHaven'],
-  reconnect: true,
-  reconnectInterval: 1500,
-});
+| Benchmark Component | Throughput | Peak RAM |
+| :--- | :--- | :--- |
+| **WebSocket Frame Encode** | **3,529,578 frames / sec** | `4.00 MB` |
+| **WebSocket Frame Decode** | **2,277,773 frames / sec** | `4.00 MB` |
+| **WriteQueue + Flush I/O** | **650.45 MB / sec** (50,000 pkts in 0.038s) | `4.00 MB` |
+| **Test Suite Run (19 tests)**| **0.153 seconds** | `8.00 MB` |
 
-socket.on('player_moved', (data) => {
-  console.log(`Player ${data.id} moved to (${data.x}, ${data.y})`);
-});
-
-// Send player input
-socket.send('player_move', { x: 2050, y: 1980 });
+Run benchmarks locally:
+```bash
+php bench/frame_bench.php
+php bench/write_queue_bench.php
 ```
 
 ---
@@ -157,7 +135,8 @@ socket.send('player_move', { x: 2050, y: 1980 });
 ## 🧪 Testing
 
 ```bash
-composer install
+composer test
+# Or directly:
 vendor/bin/phpunit
 ```
 

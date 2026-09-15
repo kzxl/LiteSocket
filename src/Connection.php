@@ -4,17 +4,28 @@ declare(strict_types=1);
 
 namespace LiteSocket;
 
+use LiteSocket\Connection\ReadBuffer;
+use LiteSocket\Connection\WriteQueue;
+
 /**
- * Represents an active client WebSocket connection.
+ * Represents an active client WebSocket connection with memory-guarded buffers and metadata.
  */
 class Connection
 {
+    public const STATE_CONNECTING = 0;
+    public const STATE_OPEN       = 1;
+    public const STATE_CLOSING    = 2;
+    public const STATE_CLOSED     = 3;
+
     private string $id;
     /** @var resource */
     private $socket;
     private string $remoteAddress;
-    private bool $handshakeDone = false;
-    private string $readBuffer = '';
+    private int $state = self::STATE_CONNECTING;
+
+    private ReadBuffer $readBuffer;
+    private WriteQueue $writeQueue;
+
     private array $headers = [];
     private array $queryParams = [];
     private array $attributes = [];
@@ -22,18 +33,37 @@ class Connection
     private array $rooms = [];
     private float $lastActivityTime;
 
+    /** @var callable|null fn(Connection $conn) */
+    private $onWriteNeeded = null;
+
     /**
      * @param resource $socket
      */
-    public function __construct(string $id, $socket, string $remoteAddress = '')
-    {
+    public function __construct(
+        string $id,
+        $socket,
+        string $remoteAddress = '',
+        int $maxReadBuffer = 2097152, // 2MB
+        int $maxWriteBuffer = 4194304  // 4MB
+    ) {
         $this->id = $id;
         $this->socket = $socket;
         $this->remoteAddress = $remoteAddress;
         $this->lastActivityTime = microtime(true);
+
+        $this->readBuffer = new ReadBuffer($maxReadBuffer);
+        $this->writeQueue = new WriteQueue($maxWriteBuffer);
     }
 
     public function getId(): string
+    {
+        return $this->id;
+    }
+
+    /**
+     * Concise alias for getId()
+     */
+    public function id(): string
     {
         return $this->id;
     }
@@ -51,35 +81,102 @@ class Connection
         return $this->remoteAddress;
     }
 
+    /**
+     * Concise alias for getRemoteAddress()
+     */
+    public function ip(): string
+    {
+        return $this->remoteAddress;
+    }
+
+    public function getState(): int
+    {
+        return $this->state;
+    }
+
+    public function setState(int $state): void
+    {
+        $this->state = $state;
+    }
+
+    public function isOpen(): bool
+    {
+        return $this->state === self::STATE_OPEN;
+    }
+
     public function isHandshakeDone(): bool
     {
-        return $this->handshakeDone;
+        return $this->state === self::STATE_OPEN;
     }
 
     public function setHandshakeDone(bool $done): void
     {
-        $this->handshakeDone = $done;
+        $this->state = $done ? self::STATE_OPEN : self::STATE_CONNECTING;
     }
+
+    // --- Read Buffer Operations ---
 
     public function appendBuffer(string $data): void
     {
-        $this->readBuffer .= $data;
+        $this->readBuffer->append($data);
         $this->lastActivityTime = microtime(true);
     }
 
     public function getBuffer(): string
     {
-        return $this->readBuffer;
+        return $this->readBuffer->get();
     }
 
     public function consumeBuffer(int $bytes): void
     {
-        $this->readBuffer = substr($this->readBuffer, $bytes);
+        $this->readBuffer->consume($bytes);
     }
+
+    public function getReadBuffer(): ReadBuffer
+    {
+        return $this->readBuffer;
+    }
+
+    // --- Write Queue Operations ---
+
+    public function getWriteQueue(): WriteQueue
+    {
+        return $this->writeQueue;
+    }
+
+    /**
+     * Set callback triggered when connection needs write event monitoring.
+     *
+     * @param callable|null $callback fn(Connection $conn)
+     */
+    public function setOnWriteNeeded(?callable $callback): void
+    {
+        $this->onWriteNeeded = $callback;
+    }
+
+    /**
+     * Flush pending bytes in WriteQueue to the stream socket.
+     */
+    public function flush(): int
+    {
+        return $this->writeQueue->flush($this->socket);
+    }
+
+    public function hasPendingWrites(): bool
+    {
+        return $this->writeQueue->hasPendingData();
+    }
+
+    // --- Headers & Query Parameters ---
 
     public function setHeaders(array $headers): void
     {
         $this->headers = $headers;
+    }
+
+    public function getHeaders(): array
+    {
+        return $this->headers;
     }
 
     public function getHeader(string $name): ?string
@@ -92,10 +189,17 @@ class Connection
         $this->queryParams = $params;
     }
 
+    public function getQueryParams(): array
+    {
+        return $this->queryParams;
+    }
+
     public function getQueryParam(string $name, ?string $default = null): ?string
     {
         return $this->queryParams[$name] ?? $default;
     }
+
+    // --- Metadata / Attributes ---
 
     public function set(string $key, mixed $value): void
     {
@@ -117,17 +221,27 @@ class Connection
         return $this->attributes;
     }
 
+    public function attributes(): array
+    {
+        return $this->attributes;
+    }
+
     /**
-     * Join a room.
+     * Quick helper for userId attribute.
      */
+    public function userId(?string $default = null): ?string
+    {
+        $val = $this->get('userId');
+        return $val !== null ? (string)$val : $default;
+    }
+
+    // --- Room Membership ---
+
     public function join(string $room): void
     {
         $this->rooms[$room] = true;
     }
 
-    /**
-     * Leave a room.
-     */
     public function leave(string $room): void
     {
         unset($this->rooms[$room]);
@@ -146,60 +260,121 @@ class Connection
         return array_keys($this->rooms);
     }
 
+    public function rooms(): array
+    {
+        return array_keys($this->rooms);
+    }
+
     public function getLastActivityTime(): float
     {
         return $this->lastActivityTime;
     }
 
-    /**
-     * Send a text message to this client.
-     */
-    public function send(string $text): bool
+    public function touch(): void
     {
-        if (!is_resource($this->socket)) {
-            return false;
-        }
+        $this->lastActivityTime = microtime(true);
+    }
 
-        $frame = Frame::encodeText($text);
-        $length = strlen($frame);
-        $written = @fwrite($this->socket, $frame);
+    // --- Messaging Methods ---
 
-        return $written === $length;
+    /**
+     * Send a raw text message (auto-encoded into RFC 6455 text frame).
+     * Non-blocking with WriteQueue buffering and backpressure.
+     */
+    public function send(string $text, bool $droppable = false): bool
+    {
+        return $this->sendText($text, $droppable);
     }
 
     /**
-     * Send a JSON-serializable message.
+     * Send an RFC 6455 Text Frame.
      */
-    public function sendJson(mixed $data): bool
+    public function sendText(string $text, bool $droppable = false): bool
+    {
+        $frame = Frame::encodeText($text);
+        return $this->writeRaw($frame, $droppable);
+    }
+
+    /**
+     * Send an RFC 6455 Binary Frame.
+     */
+    public function sendBinary(string $data, bool $droppable = false): bool
+    {
+        $frame = Frame::encodeBinary($data);
+        return $this->writeRaw($frame, $droppable);
+    }
+
+    /**
+     * Send a JSON-serializable payload.
+     */
+    public function sendJson(mixed $data, bool $droppable = false): bool
     {
         $json = json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         if ($json === false) {
             return false;
         }
-        return $this->send($json);
+        return $this->sendText($json, $droppable);
     }
 
     /**
-     * Send a Ping to the client.
+     * Send an RFC 6455 Ping frame.
      */
-    public function ping(): bool
+    public function ping(string $payload = ''): bool
     {
-        if (!is_resource($this->socket)) {
+        $frame = Frame::encodePing($payload);
+        return $this->writeRaw($frame, false);
+    }
+
+    /**
+     * Enqueue raw frame bytes to WriteQueue and trigger write notification.
+     */
+    public function writeRaw(string $frameBytes, bool $droppable = false): bool
+    {
+        if (!is_resource($this->socket) || $this->state === self::STATE_CLOSED) {
             return false;
         }
-        $frame = Frame::encodePing();
-        return @fwrite($this->socket, $frame) !== false;
+
+        // 1. If queue is empty, attempt immediate write optimization
+        if (!$this->writeQueue->hasPendingData()) {
+            $written = @fwrite($this->socket, $frameBytes);
+            if ($written === strlen($frameBytes)) {
+                return true; // Fast-path: 100% written synchronously
+            }
+
+            if ($written !== false && $written > 0) {
+                // Partial write: enqueue remainder
+                $frameBytes = substr($frameBytes, $written);
+            }
+        }
+
+        // 2. Enqueue remaining bytes into non-blocking WriteQueue
+        $ok = $this->writeQueue->enqueue($frameBytes, $droppable);
+        if ($ok && $this->onWriteNeeded !== null) {
+            ($this->onWriteNeeded)($this);
+        }
+
+        return $ok;
     }
 
     /**
-     * Close connection with status code.
+     * Close connection with RFC 6455 status code.
      */
     public function close(int $code = 1000, string $reason = ''): void
     {
+        if ($this->state === self::STATE_CLOSED) {
+            return;
+        }
+
+        $this->state = self::STATE_CLOSING;
+
         if (is_resource($this->socket)) {
             $frame = Frame::encodeClose($code, $reason);
             @fwrite($this->socket, $frame);
             @fclose($this->socket);
         }
+
+        $this->state = self::STATE_CLOSED;
+        $this->readBuffer->clear();
+        $this->writeQueue->clear();
     }
 }

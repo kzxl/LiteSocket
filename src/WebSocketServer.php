@@ -4,24 +4,45 @@ declare(strict_types=1);
 
 namespace LiteSocket;
 
+use LiteSocket\Connection\ConnectionPool;
+use LiteSocket\Messaging\PubSub\LocalPubSub;
+use LiteSocket\Messaging\PubSub\PubSubInterface;
+use LiteSocket\Messaging\RoomManager;
+use LiteSocket\Messaging\Router;
+use LiteSocket\Protocol\WebSocket\Frame;
+use LiteSocket\Protocol\WebSocket\FrameParser;
+use LiteSocket\Protocol\WebSocket\Handshake;
+use LiteSocket\Runtime\EventLoopInterface;
+use LiteSocket\Runtime\StreamSelectLoop;
+use LiteSocket\Transport\StreamSocketTransport;
+use LiteSocket\Transport\TransportInterface;
+use OverflowException;
 use Throwable;
 
 /**
- * Sovereign, Zero-Dependency RFC 6455 WebSocket Server for PHP 8.2+.
- * Uses non-blocking stream_socket_server & stream_select event loop.
+ * Sovereign, Zero-Dependency RFC 6455 WebSocket Server 2.x for PHP 8.2+.
+ *
+ * Coordinates 5 Modular Cores:
+ * - Runtime:    Non-blocking EventLoop with independent timer queue
+ * - Transport:  Non-blocking TCP server transport
+ * - Protocol:   RFC 6455 Handshake & Streaming Frame Parser
+ * - Connection: Memory-guarded ReadBuffer & Non-blocking WriteQueue with Backpressure
+ * - Messaging:  Room Pub/Sub, Router dispatcher, and PubSub adapters
  */
 class WebSocketServer
 {
     private string $host;
     private int $port;
-    /** @var resource|null */
-    private $masterSocket = null;
-    private bool $running = false;
+    private array $options;
 
-    /** @var array<string, Connection> connId => Connection */
-    private array $connections = [];
-
+    // 5 Modular Cores
+    private TransportInterface $transport;
+    private EventLoopInterface $loop;
+    private ConnectionPool $pool;
+    private FrameParser $frameParser;
     private RoomManager $rooms;
+    private Router $router;
+    private PubSubInterface $pubsub;
 
     /** @var array<string, callable[]> */
     private array $eventHandlers = [
@@ -33,19 +54,92 @@ class WebSocketServer
     ];
 
     private int $nextConnectionId = 1;
-    private float $idleTimeout = 120.0; // 2 minutes heartbeat timeout
+    private float $idleTimeout = 120.0;
+    private bool $running = false;
 
-    public function __construct(string $host = '0.0.0.0', int $port = 8088)
-    {
+    public function __construct(
+        string $host = '0.0.0.0',
+        int $port = 8088,
+        array $options = [],
+        ?EventLoopInterface $loop = null,
+        ?TransportInterface $transport = null
+    ) {
         $this->host = $host;
         $this->port = $port;
+        $this->options = array_merge([
+            'maxReadBuffer'  => 2097152,  // 2MB
+            'maxWriteBuffer' => 4194304,  // 4MB
+            'maxFrameSize'   => 2097152,  // 2MB
+            'idleTimeout'    => 120.0,    // 120s
+            'allowedOrigins' => null,     // null = allow all
+            'so_reuseport'   => true,
+            'backlog'        => 1024,
+        ], $options);
+
+        $this->idleTimeout = (float)$this->options['idleTimeout'];
+
+        // Instantiate modular cores
+        $this->loop = $loop ?? new StreamSelectLoop();
+        $this->transport = $transport ?? new StreamSocketTransport();
+        $this->pool = new ConnectionPool();
+        $this->frameParser = new FrameParser((int)$this->options['maxFrameSize']);
         $this->rooms = new RoomManager();
+        $this->router = new Router();
+        $this->pubsub = new LocalPubSub();
+    }
+
+    // --- Accessors for 5 Cores ---
+
+    public function getLoop(): EventLoopInterface
+    {
+        return $this->loop;
+    }
+
+    public function getTransport(): TransportInterface
+    {
+        return $this->transport;
     }
 
     public function getRoomManager(): RoomManager
     {
         return $this->rooms;
     }
+
+    public function getRouter(): Router
+    {
+        return $this->router;
+    }
+
+    public function getPubSub(): PubSubInterface
+    {
+        return $this->pubsub;
+    }
+
+    public function setPubSub(PubSubInterface $pubsub): self
+    {
+        $this->pubsub = $pubsub;
+        return $this;
+    }
+
+    public function getConnectionPool(): ConnectionPool
+    {
+        return $this->pool;
+    }
+
+    /**
+     * @return array<string, Connection>
+     */
+    public function getConnections(): array
+    {
+        return $this->pool->all();
+    }
+
+    public function getConnectionCount(): int
+    {
+        return $this->pool->count();
+    }
+
+    // --- Event & Route Registration ---
 
     /**
      * Register an event listener ('connect', 'message', 'close', 'error', 'tick').
@@ -59,125 +153,33 @@ class WebSocketServer
     }
 
     /**
-     * Start the server and enter the event loop.
+     * Register a message type route handler.
      *
-     * @param float|null $tickInterval Tick interval in seconds (e.g., 0.05 for 20 TPS).
+     * @param string $type e.g. 'player_move', 'chat'
+     * @param callable $handler fn(Connection $conn, mixed $payload)
      */
-    public function run(?float $tickInterval = 0.05): void
+    public function route(string $type, callable $handler): self
     {
-        $address = "tcp://{$this->host}:{$this->port}";
-        $context = stream_context_create([
-            'socket' => [
-                'so_reuseport' => 1,
-                'backlog'      => 1024,
-            ],
-        ]);
-
-        $errno = 0;
-        $errstr = '';
-        $this->masterSocket = @stream_socket_server($address, $errno, $errstr, STREAM_SERVER_BIND | STREAM_SERVER_LISTEN, $context);
-
-        if (!$this->masterSocket) {
-            throw new \RuntimeException("LiteSocket failed to bind on {$address}: [{$errno}] {$errstr}");
-        }
-
-        stream_set_blocking($this->masterSocket, false);
-        $this->running = true;
-
-        echo sprintf("[LiteSocket] Listening on ws://%s:%d (PID: %d)\n", $this->host, $this->port, getmypid());
-
-        $lastTick = microtime(true);
-
-        while ($this->running) {
-            $read = [$this->masterSocket];
-            $write = null;
-            $except = null;
-
-            foreach ($this->connections as $conn) {
-                $sock = $conn->getSocket();
-                if (is_resource($sock)) {
-                    $read[] = $sock;
-                }
-            }
-
-            // Timeout in microseconds: 20ms (0.02s) to allow responsive ticks
-            $timeoutSec = 0;
-            $timeoutUsec = 20000;
-            $numChanged = @stream_select($read, $write, $except, $timeoutSec, $timeoutUsec);
-
-            if ($numChanged === false) {
-                // Interrupted by signal or error
-                continue;
-            }
-
-            // 1. Check for incoming new connections
-            if (in_array($this->masterSocket, $read, true)) {
-                $newSocket = @stream_socket_accept($this->masterSocket, 0, $peerName);
-                if ($newSocket) {
-                    stream_set_blocking($newSocket, false);
-                    $connId = 'c_' . ($this->nextConnectionId++);
-                    $conn = new Connection($connId, $newSocket, (string)$peerName);
-                    $this->connections[$connId] = $conn;
-                }
-                // Remove master from read list
-                $key = array_search($this->masterSocket, $read, true);
-                if ($key !== false) {
-                    unset($read[$key]);
-                }
-            }
-
-            // 2. Process data from clients
-            foreach ($read as $socket) {
-                $conn = $this->findConnectionBySocket($socket);
-                if (!$conn) {
-                    continue;
-                }
-
-                $data = @fread($socket, 8192);
-
-                if ($data === false || $data === '') {
-                    // Socket closed by peer or empty read
-                    $this->disconnect($conn);
-                    continue;
-                }
-
-                $conn->appendBuffer($data);
-
-                if (!$conn->isHandshakeDone()) {
-                    $this->handleHandshake($conn);
-                } else {
-                    $this->handleFrames($conn);
-                }
-            }
-
-            // 3. Tick Loop for authoritative physics/logic (e.g. 20 TPS)
-            $now = microtime(true);
-            if ($tickInterval !== null && ($now - $lastTick) >= $tickInterval) {
-                $delta = $now - $lastTick;
-                $lastTick = $now;
-                $this->emit('tick', $delta);
-            }
-        }
-
-        $this->shutdown();
+        $this->router->route($type, $handler);
+        return $this;
     }
 
-    public function stop(): void
-    {
-        $this->running = false;
-    }
+    // --- Broadcast APIs ---
 
-    public function broadcastAll(mixed $message, ?Connection $exclude = null): int
+    /**
+     * Broadcast a message to all connected clients.
+     */
+    public function broadcastAll(mixed $message, ?Connection $exclude = null, bool $droppable = false): int
     {
         $payload = is_string($message) ? $message : json_encode($message, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         $excludeId = $exclude?->getId();
         $count = 0;
 
-        foreach ($this->connections as $connId => $conn) {
+        foreach ($this->pool->all() as $connId => $conn) {
             if ($excludeId !== null && $connId === $excludeId) {
                 continue;
             }
-            if ($conn->isHandshakeDone() && $conn->send($payload)) {
+            if ($conn->isOpen() && $conn->sendText($payload, $droppable)) {
                 $count++;
             }
         }
@@ -185,112 +187,177 @@ class WebSocketServer
         return $count;
     }
 
-    public function broadcastToRoom(string $room, mixed $message, ?Connection $exclude = null): int
+    /**
+     * Concise alias for broadcastAll
+     */
+    public function broadcast(mixed $message, ?Connection $exclude = null, bool $droppable = false): int
     {
-        return $this->rooms->broadcast($room, $message, $exclude);
-    }
-
-    public function getConnectionCount(): int
-    {
-        return count($this->connections);
+        return $this->broadcastAll($message, $exclude, $droppable);
     }
 
     /**
-     * @return array<string, Connection>
+     * Broadcast a message to all connections in a specific room.
      */
-    public function getConnections(): array
+    public function broadcastToRoom(string $room, mixed $message, ?Connection $exclude = null, bool $droppable = false): int
     {
-        return $this->connections;
+        return $this->rooms->broadcast($room, $message, $exclude, $droppable);
     }
 
-    // --- Internal Handlers ---
+    // --- Lifecycle & Server Loop ---
+
+    /**
+     * Start the server and enter the event loop.
+     *
+     * @param float|null $tickInterval Tick interval in seconds (e.g., 0.05 for 20 TPS).
+     */
+    public function run(?float $tickInterval = 0.05): void
+    {
+        // 1. Bind and listen TCP socket
+        $this->transport->listen($this->host, $this->port, $this->options);
+        $masterSocket = $this->transport->getMasterSocket();
+
+        // 2. Register master socket in read set of EventLoop
+        $this->loop->addRead($masterSocket, function ($socket) {
+            $this->handleAccept();
+        });
+
+        // 3. Register Game Tick as an independent recurring timer (NO LONGER BOUND TO SELECT TIMEOUT)
+        if ($tickInterval !== null && $tickInterval > 0) {
+            $this->loop->every($tickInterval, function () use ($tickInterval) {
+                $this->emit('tick', $tickInterval);
+            });
+        }
+
+        // 4. Register periodic idle timeout & stale connection sweep
+        if ($this->idleTimeout > 0) {
+            $this->loop->every(10.0, function () {
+                $this->sweepIdleConnections();
+            });
+        }
+
+        $this->running = true;
+        echo sprintf("[LiteSocket 2.x] Listening on ws://%s:%d (PID: %d)\n", $this->host, $this->port, getmypid());
+
+        // 5. Run the event loop
+        try {
+            $this->loop->run();
+        } finally {
+            $this->shutdown();
+        }
+    }
+
+    public function stop(): void
+    {
+        $this->running = false;
+        $this->loop->stop();
+    }
+
+    // --- Internal Socket & Protocol Handlers ---
+
+    private function handleAccept(): void
+    {
+        $accepted = $this->transport->accept();
+        if (!$accepted) {
+            return;
+        }
+
+        [$clientSocket, $peerName] = $accepted;
+        $connId = 'c_' . ($this->nextConnectionId++);
+
+        $conn = new Connection(
+            $connId,
+            $clientSocket,
+            $peerName,
+            (int)$this->options['maxReadBuffer'],
+            (int)$this->options['maxWriteBuffer']
+        );
+
+        // When connection has pending writes that couldn't be flushed immediately, register in loop write set
+        $conn->setOnWriteNeeded(function (Connection $c) {
+            $sock = $c->getSocket();
+            if (is_resource($sock)) {
+                $this->loop->addWrite($sock, function ($s) use ($c) {
+                    $this->handleClientWrite($c);
+                });
+            }
+        });
+
+        $this->pool->add($conn);
+
+        // Register client socket for read notifications
+        $this->loop->addRead($clientSocket, function ($socket) use ($conn) {
+            $this->handleClientRead($conn);
+        });
+    }
+
+    private function handleClientRead(Connection $conn): void
+    {
+        $socket = $conn->getSocket();
+        if (!is_resource($socket)) {
+            $this->disconnect($conn);
+            return;
+        }
+
+        $data = @fread($socket, 8192);
+
+        if ($data === false || $data === '') {
+            $this->disconnect($conn);
+            return;
+        }
+
+        try {
+            $conn->appendBuffer($data);
+
+            if (!$conn->isHandshakeDone()) {
+                $this->handleHandshake($conn);
+            } else {
+                $this->handleFrames($conn);
+            }
+        } catch (OverflowException $e) {
+            $this->handleError($e);
+            $this->disconnect($conn);
+        } catch (Throwable $e) {
+            $this->handleError($e);
+        }
+    }
+
+    private function handleClientWrite(Connection $conn): void
+    {
+        $socket = $conn->getSocket();
+        if (!is_resource($socket)) {
+            $this->disconnect($conn);
+            return;
+        }
+
+        $conn->flush();
+
+        // If all pending bytes have been flushed, remove socket from writable notification set
+        if (!$conn->hasPendingWrites()) {
+            $this->loop->removeWrite($socket);
+        }
+    }
 
     private function handleHandshake(Connection $conn): void
     {
-        $buffer = $conn->getBuffer();
-        $headerEnd = strpos($buffer, "\r\n\r\n");
+        $allowedOrigins = $this->options['allowedOrigins'] ?? null;
+        $done = Handshake::handle($conn, $allowedOrigins);
 
-        if ($headerEnd === false) {
-            // Incomplete HTTP request, wait for more data
-            if (strlen($buffer) > 4096) {
-                $conn->close(1002, 'Handshake headers too large');
-                $this->disconnect($conn);
+        if ($done) {
+            // Auto-join room from query param if provided (e.g. ?room=CH-1_SanctuaryHaven)
+            $autoRoom = $conn->getQueryParam('room');
+            if ($autoRoom !== null && $autoRoom !== '') {
+                $this->rooms->join($autoRoom, $conn);
             }
-            return;
+
+            $this->emit('connect', $conn);
         }
-
-        $rawHeaders = substr($buffer, 0, $headerEnd);
-        $conn->consumeBuffer($headerEnd + 4);
-
-        $lines = explode("\r\n", $rawHeaders);
-        $requestLine = array_shift($lines);
-        $parts = explode(' ', $requestLine);
-
-        if (count($parts) < 2 || strtoupper($parts[0]) !== 'GET') {
-            $conn->close(1002, 'Invalid HTTP request');
-            $this->disconnect($conn);
-            return;
-        }
-
-        $urlParts = parse_url($parts[1]);
-        $path = $urlParts['path'] ?? '/';
-        $query = [];
-        if (!empty($urlParts['query'])) {
-            parse_str($urlParts['query'], $query);
-        }
-        $conn->setQueryParams($query);
-
-        $headers = [];
-        foreach ($lines as $line) {
-            $colon = strpos($line, ':');
-            if ($colon !== false) {
-                $key = strtolower(trim(substr($line, 0, $colon)));
-                $val = trim(substr($line, $colon + 1));
-                $headers[$key] = $val;
-            }
-        }
-        $conn->setHeaders($headers);
-
-        $secKey = $headers['sec-websocket-key'] ?? null;
-        if (!$secKey) {
-            $conn->close(1002, 'Missing Sec-WebSocket-Key');
-            $this->disconnect($conn);
-            return;
-        }
-
-        // Calculate Sec-WebSocket-Accept token RFC 6455
-        $magic = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
-        $acceptKey = base64_encode(sha1($secKey . $magic, true));
-
-        $response = "HTTP/1.1 101 Switching Protocols\r\n"
-            . "Upgrade: websocket\r\n"
-            . "Connection: Upgrade\r\n"
-            . "Sec-WebSocket-Accept: {$acceptKey}\r\n"
-            . "Server: LiteSocket/1.0\r\n\r\n";
-
-        @fwrite($conn->getSocket(), $response);
-        $conn->setHandshakeDone(true);
-
-        // Auto-join room from query param if provided (e.g. ?room=CH-1_SanctuaryHaven)
-        $autoRoom = $conn->getQueryParam('room');
-        if ($autoRoom !== null && $autoRoom !== '') {
-            $this->rooms->join($autoRoom, $conn);
-        }
-
-        $this->emit('connect', $conn);
     }
 
     private function handleFrames(Connection $conn): void
     {
-        while (strlen($conn->getBuffer()) > 0) {
-            $frame = Frame::decode($conn->getBuffer());
-            if ($frame === null) {
-                // Incomplete frame, wait for more bytes
-                break;
-            }
+        $frames = $this->frameParser->parse($conn);
 
-            $conn->consumeBuffer($frame['bytesConsumed']);
-
+        foreach ($frames as $frame) {
             $opcode = $frame['opcode'];
             $payload = $frame['payload'];
 
@@ -299,13 +366,16 @@ class WebSocketServer
                     $this->processTextMessage($conn, $payload);
                     break;
 
+                case Frame::OPCODE_BINARY:
+                    $this->emit('message', $conn, $payload, null);
+                    break;
+
                 case Frame::OPCODE_PING:
-                    // Respond with Pong
-                    $conn->send(Frame::encodePong($payload));
+                    $conn->writeRaw(Frame::encodePong($payload), false);
                     break;
 
                 case Frame::OPCODE_PONG:
-                    // Keepalive acknowledged
+                    $conn->touch();
                     break;
 
                 case Frame::OPCODE_CLOSE:
@@ -313,7 +383,6 @@ class WebSocketServer
                     return;
 
                 default:
-                    // Ignore unsupported opcodes
                     break;
             }
         }
@@ -328,46 +397,59 @@ class WebSocketServer
 
         // Handle native protocol events (subscribe, unsubscribe, ping)
         if (is_array($json) && isset($json['type'])) {
-            $type = $json['type'];
+            $type = (string)$json['type'];
+
             if ($type === 'subscribe' && !empty($json['room'])) {
                 $this->rooms->join((string)$json['room'], $conn);
                 $conn->sendJson(['type' => 'subscribed', 'room' => $json['room']]);
                 return;
-            } elseif ($type === 'unsubscribe' && !empty($json['room'])) {
+            }
+
+            if ($type === 'unsubscribe' && !empty($json['room'])) {
                 $this->rooms->leave((string)$json['room'], $conn);
                 $conn->sendJson(['type' => 'unsubscribed', 'room' => $json['room']]);
                 return;
-            } elseif ($type === 'ping') {
+            }
+
+            if ($type === 'ping') {
                 $conn->sendJson(['type' => 'pong', 'timestamp' => microtime(true)]);
                 return;
             }
+
+            // Route via Router dispatcher if a route is registered
+            if ($this->router->has($type)) {
+                $this->router->dispatch($conn, $type, $json);
+            }
         }
 
+        // Always emit 'message' event for backwards compatibility
         $this->emit('message', $conn, $message, $json);
     }
 
-    private function disconnect(Connection $conn): void
+    public function disconnect(Connection $conn): void
     {
-        $connId = $conn->getId();
-        if (!isset($this->connections[$connId])) {
-            return;
+        $sock = $conn->getSocket();
+        if (is_resource($sock)) {
+            $this->loop->removeRead($sock);
+            $this->loop->removeWrite($sock);
         }
 
         $this->rooms->leaveAll($conn);
         $this->emit('close', $conn);
 
-        unset($this->connections[$connId]);
+        $this->pool->remove($conn);
         $conn->close();
     }
 
-    private function findConnectionBySocket($socket): ?Connection
+    private function sweepIdleConnections(): void
     {
-        foreach ($this->connections as $conn) {
-            if ($conn->getSocket() === $socket) {
-                return $conn;
+        $now = microtime(true);
+        foreach ($this->pool->all() as $conn) {
+            if (($now - $conn->getLastActivityTime()) > $this->idleTimeout) {
+                $conn->close(1000, 'Connection idle timeout');
+                $this->disconnect($conn);
             }
         }
-        return null;
     }
 
     private function emit(string $event, ...$args): void
@@ -387,7 +469,6 @@ class WebSocketServer
             try {
                 $handler($e);
             } catch (Throwable) {
-                // Prevent infinite loop
             }
         }
         echo sprintf("[LiteSocket Error] %s in %s:%d\n", $e->getMessage(), $e->getFile(), $e->getLine());
@@ -395,12 +476,11 @@ class WebSocketServer
 
     private function shutdown(): void
     {
-        foreach ($this->connections as $conn) {
+        foreach ($this->pool->all() as $conn) {
             $this->disconnect($conn);
         }
-        if (is_resource($this->masterSocket)) {
-            @fclose($this->masterSocket);
-        }
-        echo "[LiteSocket] Server stopped.\n";
+
+        $this->transport->close();
+        echo "[LiteSocket 2.x] Server stopped.\n";
     }
 }
