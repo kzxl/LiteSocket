@@ -28,6 +28,9 @@
         "rooms",
         "gaming",
         "high-performance",
+        "cluster",
+        "redis",
+        "scaling",
         "php82",
         "zero-dependency"
     ],

@@ -5,8 +5,10 @@ declare(strict_types=1);
 namespace LiteSocket;
 
 use LiteSocket\Connection\ConnectionPool;
+use LiteSocket\Messaging\ClusterBridge;
 use LiteSocket\Messaging\PubSub\LocalPubSub;
 use LiteSocket\Messaging\PubSub\PubSubInterface;
+use LiteSocket\Messaging\PubSub\RedisPubSub;
 use LiteSocket\Messaging\RoomManager;
 use LiteSocket\Messaging\Router;
 use LiteSocket\Protocol\WebSocket\Frame;
@@ -43,6 +45,7 @@ class WebSocketServer
     private RoomManager $rooms;
     private Router $router;
     private PubSubInterface $pubsub;
+    private ?ClusterBridge $clusterBridge = null;
 
     /** @var array<string, callable[]> */
     private array $eventHandlers = [
@@ -118,6 +121,56 @@ class WebSocketServer
     public function setPubSub(PubSubInterface $pubsub): self
     {
         $this->pubsub = $pubsub;
+        if ($pubsub instanceof RedisPubSub) {
+            $pubsub->attachLoop($this->loop);
+        }
+        return $this;
+    }
+
+    /**
+     * Enable multi-node cluster scaling via Pub/Sub (e.g. Redis).
+     */
+    public function enableCluster(?PubSubInterface $pubsub = null, ?string $nodeId = null, string $channelPrefix = 'litesocket:cluster:room:'): self
+    {
+        if ($pubsub !== null) {
+            $this->setPubSub($pubsub);
+        }
+
+        $this->clusterBridge = new ClusterBridge($this, $this->pubsub, $nodeId, $channelPrefix);
+        return $this;
+    }
+
+    public function getClusterBridge(): ?ClusterBridge
+    {
+        return $this->clusterBridge;
+    }
+
+    public function isClusterEnabled(): bool
+    {
+        return $this->clusterBridge !== null;
+    }
+
+    /**
+     * Join a connection to a room and ensure cluster-wide subscription.
+     */
+    public function joinRoom(string $room, Connection $conn): self
+    {
+        $this->rooms->join($room, $conn);
+        if ($this->clusterBridge !== null) {
+            $this->clusterBridge->subscribeRoom($room);
+        }
+        return $this;
+    }
+
+    /**
+     * Remove a connection from a room and clean up cluster-wide subscription if empty.
+     */
+    public function leaveRoom(string $room, Connection $conn): self
+    {
+        $this->rooms->leave($room, $conn);
+        if ($this->clusterBridge !== null && !$this->rooms->hasRoom($room)) {
+            $this->clusterBridge->unsubscribeRoom($room);
+        }
         return $this;
     }
 
@@ -200,6 +253,9 @@ class WebSocketServer
      */
     public function broadcastToRoom(string $room, mixed $message, ?Connection $exclude = null, bool $droppable = false): int
     {
+        if ($this->clusterBridge !== null) {
+            return $this->clusterBridge->broadcast($room, $message, $exclude, $droppable);
+        }
         return $this->rooms->broadcast($room, $message, $exclude, $droppable);
     }
 

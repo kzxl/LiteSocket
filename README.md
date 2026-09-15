@@ -3,9 +3,9 @@
 [![Latest Version](https://img.shields.io/github/v/release/kzxl/LiteSocket?label=version&color=blue)](https://github.com/kzxl/LiteSocket/releases)
 [![PHP Version](https://img.shields.io/badge/php-%3E%3D8.2-8892BF.svg)](https://php.net)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Tests: Passing](https://img.shields.io/badge/tests-19%20passed-brightgreen.svg)](tests/)
+[![Tests: Passing](https://img.shields.io/badge/tests-30%20passed-brightgreen.svg)](tests/)
 
-An ultra-high-performance, zero-dependency RFC 6455 WebSocket Server and Server-Sent Events (SSE) Streamer for **PHP 8.2+** featuring 5 modular cores, non-blocking WriteQueue with Backpressure, Router dispatcher, and independent EventLoop.
+An ultra-high-performance, zero-dependency RFC 6455 WebSocket Server and Server-Sent Events (SSE) Streamer for **PHP 8.2+** featuring 5 modular cores, multi-node cluster scaling via pure RESP Redis Pub/Sub, non-blocking WriteQueue with Backpressure, Router dispatcher, and independent EventLoop.
 
 Part of the **LitePlatform** sovereign software suite (< 10MB RAM, zero 3rd-party vendor lock-in).
 
@@ -21,10 +21,11 @@ LiteSocket/
 ├── Transport/    # StreamSocketTransport: TCP bind, listen (SO_REUSEPORT), accept
 ├── Protocol/     # RFC 6455 Handshake, Origin validation, Streaming FrameParser
 ├── Connection/   # ConnectionPool (O(1)), ReadBuffer (OOM Guard), WriteQueue (Backpressure)
-└── Messaging/    # Router dispatcher, lightweight in-memory RoomManager, PubSub contract
+└── Messaging/    # Router dispatcher, RoomManager, RedisPubSub (Zero ext-redis), ClusterBridge
 ```
 
 ### Key Enhancements in 2.x
+- **Multi-Node Cluster Scaling (2.1.0)**: Horizontal room replication across multiple processes/servers with pure-PHP `RedisPubSub` (Zero `ext-redis` dependency) and automated echo-loop elimination.
 - **Independent EventLoop**: Network I/O is completely decoupled from game/application tick. Network events trigger with zero latency, while game ticks execute via recurring timers.
 - **WriteQueue & Partial-Write Protection**: Outgoing data is buffered in RAM. Non-blocking `@fwrite()` prevents TCP stream corruption on slow or lagging clients.
 - **Backpressure & Drop Policies**: Configurable buffer limit (`maxWriteBuffer`, default 4MB). Droppable packets (e.g. player movement / telemetry) are discarded gracefully when buffers are full.
@@ -109,6 +110,34 @@ $server->on('close', function (Connection $conn) {
 
 // Run server with authoritative game tick (20 TPS)
 $server->run(tickInterval: 0.05);
+```
+
+---
+
+## 🌐 Multi-Node Cluster Scaling (Zero ext-redis)
+
+Scale WebSocket servers horizontally across multiple processes or VPS instances with built-in pure-PHP Redis Pub/Sub:
+
+```php
+use LiteSocket\WebSocketServer;
+use LiteSocket\Messaging\PubSub\RedisPubSub;
+
+$server = new WebSocketServer('0.0.0.0', 8088);
+
+// Enable cluster replication via Redis RESP protocol (zero extensions needed!)
+$redis = new RedisPubSub(host: '127.0.0.1', port: 6379, loop: $server->getLoop());
+$server->enableCluster($redis);
+
+// When clients join rooms:
+$server->on('connect', function ($conn) use ($server) {
+    $server->joinRoom('lobby', $conn);
+});
+
+// Broadcasts replicate instantly to all instances across the cluster!
+$server->broadcastToRoom('lobby', [
+    'type' => 'chat',
+    'text' => 'Hello from node A!',
+]);
 ```
 
 ---
