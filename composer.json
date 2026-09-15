@@ -1,6 +1,6 @@
 {
     "name": "kzxl/lite-socket",
-    "description": "Ultra-lightweight, zero-dependency RFC 6455 WebSocket Server & SSE Streamer for PHP 8.2+ with Room Pub/Sub and TypeScript Client.",
+    "description": "Ultra-high-performance, zero-dependency RFC 6455 WebSocket Server & SSE Streamer for PHP 8.2+ with 5 modular cores, non-blocking WriteQueue, Backpressure, and Room Pub/Sub.",
     "type": "library",
     "license": "MIT",
     "homepage": "https://github.com/kzxl/LiteSocket",
@@ -20,9 +20,14 @@
         "realtime",
         "sse",
         "server-sent-events",
+        "event-loop",
+        "write-queue",
+        "backpressure",
+        "router",
         "pubsub",
         "rooms",
         "gaming",
+        "high-performance",
         "php82",
         "zero-dependency"
     ],
