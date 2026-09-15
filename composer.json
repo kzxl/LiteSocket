@@ -1,0 +1,52 @@
+{
+    "name": "kzxl/lite-socket",
+    "description": "Ultra-lightweight, zero-dependency RFC 6455 WebSocket Server & SSE Streamer for PHP 8.2+ with Room Pub/Sub and TypeScript Client.",
+    "type": "library",
+    "license": "MIT",
+    "homepage": "https://github.com/kzxl/LiteSocket",
+    "support": {
+        "issues": "https://github.com/kzxl/LiteSocket/issues",
+        "source": "https://github.com/kzxl/LiteSocket"
+    },
+    "authors": [
+        {
+            "name": "Phong Vo",
+            "email": "phong.vo@kzxl.com"
+        }
+    ],
+    "keywords": [
+        "websocket",
+        "rfc6455",
+        "realtime",
+        "sse",
+        "server-sent-events",
+        "pubsub",
+        "rooms",
+        "gaming",
+        "php82",
+        "zero-dependency"
+    ],
+    "minimum-stability": "stable",
+    "replace": {
+        "kzxl/litesocket": "self.version"
+    },
+    "require": {
+        "php": ">=8.2"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^11.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "LiteSocket\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "LiteSocket\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "phpunit --colors=always"
+    }
+}
